@@ -475,8 +475,17 @@ def collect_attachments(msg) -> list:
     return result
 
 
-def build_forward(s: Settings, msg, include_attachments: bool = True) -> bytes:
-    """Thunderbird の「インラインで転送」と同じ形の転送メールを作る。元メールの添付ファイルも付ける。"""
+# 転送メールの形。送れなかったときは、より小さい形にして送り直す
+LEVEL_FULL, LEVEL_NO_ATTACHMENTS, LEVEL_HEADERS_ONLY = 0, 1, 2
+LEVEL_LABEL = {LEVEL_FULL: "", LEVEL_NO_ATTACHMENTS: "（添付ファイルなし）", LEVEL_HEADERS_ONLY: "（ヘッダーのみ）"}
+
+
+def build_forward(s: Settings, msg, level: int = LEVEL_FULL, reason: str = "") -> bytes:
+    """Thunderbird の「インラインで転送」と同じ形の転送メールを作る。元メールの添付ファイルも付ける。
+
+    level=LEVEL_NO_ATTACHMENTS なら添付ファイルを外し、LEVEL_HEADERS_ONLY なら本文も外す。
+    外したときは、その理由（reason）を本文の最後に書き添える。
+    """
     subject = _header(msg, "Subject")
 
     lines = ["-------- Forwarded Message --------"]
@@ -485,20 +494,30 @@ def build_forward(s: Settings, msg, include_attachments: bool = True) -> bytes:
         value = _header(msg, name)
         if value or name in ("Subject", "Date", "From", "To"):
             lines.append(f"{label}:\t{value}")
-    lines += ["", "", extract_text(msg) or "（本文をテキストで表示できません。大学のメールで確認してください）"]
+    lines += ["", ""]
+    if level < LEVEL_HEADERS_ONLY:
+        lines.append(extract_text(msg) or "（本文をテキストで表示できません。大学のメールで確認してください）")
 
-    attachments = collect_attachments(msg)
-    if attachments:
-        names = "、".join(a[0] for a in attachments)
+    try:
+        attachments = collect_attachments(msg)
+    except Exception as e:
+        log.warning("添付ファイルを取り出せませんでした: %s", e)
+        attachments = []
+    names = "、".join(a[0] for a in attachments)
+    note = None
+    if level == LEVEL_HEADERS_ONLY:
+        what = f"本文と添付ファイル（{names}）" if attachments else "本文"
+        note = f"※{what}は{reason or '転送できなかった'}ため転送していません。"
+        attachments = []
+    elif attachments and level == LEVEL_NO_ATTACHMENTS:
+        note = f"※添付ファイル（{names}）は{reason or '転送できなかった'}ため転送していません。"
+        attachments = []
+    elif attachments and sum(len(a[3]) for a in attachments) > s.max_attach_bytes:
         total = sum(len(a[3]) for a in attachments)
-        why = None
-        if not include_attachments:
-            why = "転送先のサーバーに受け付けられなかった"
-        elif total > s.max_attach_bytes:
-            why = f"大きい（合計 {total / 1024 / 1024:.1f}MB）"
-        if why:
-            lines += ["", f"※添付ファイル（{names}）は{why}ため転送していません。大学のメールで確認してください。"]
-            attachments = []
+        note = f"※添付ファイル（{names}）は大きい（合計 {total / 1024 / 1024:.1f}MB）ため転送していません。"
+        attachments = []
+    if note:
+        lines += ["", note + "大学のメールで確認してください。"]
 
     fwd = EmailMessage(policy=SMTP_POLICY)
     fwd["From"] = s.forward_from
@@ -547,7 +566,21 @@ def _safe_quit(smtp) -> None:
         pass
 
 
+class MessageTransient(RuntimeError):
+    """SMTP にはつながったが、1通の送信の途中で失敗した。回数を数えて、続くなら小さい形にする・飛ばす。"""
+
+
+def _size_limit(smtp) -> int:
+    """送信サーバーが SIZE で知らせてくるメールの大きさの上限（バイト）。無ければ 0。"""
+    value = (getattr(smtp, "esmtp_features", {}) or {}).get("size", "")
+    try:
+        return int(str(value).split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
 def send_mail(s: Settings, data: bytes) -> None:
+    """そのまま送る（テスト送信用）。"""
     smtp = _open_smtp(s)
     try:
         opts = ["BODY=8BITMIME"] if smtp.has_extn("8bitmime") else []
@@ -556,7 +589,43 @@ def send_mail(s: Settings, data: bytes) -> None:
         _safe_quit(smtp)
 
 
+def deliver(s: Settings, data: bytes):
+    """転送メールを1通送る。結果を ("sent" | "too_big" | "rejected", 詳細) で返す。
+
+    - 接続・ログインの失敗（ネットワーク障害など）は、そのまま例外にする（メールのせいではないので数えない）
+    - 送信の途中の失敗・一時的な拒否（4xx）は MessageTransient にする（このメールの失敗として数える）
+    - このメールが大きすぎる・内容で断られた（5xx）ときは "too_big" / "rejected" を返す
+    """
+    smtp = _open_smtp(s)
+    try:
+        limit = _size_limit(smtp)
+        if limit and len(data) > limit:
+            return "too_big", f"送信サーバーの上限 {limit / 1024 / 1024:.1f}MB を超える {len(data) / 1024 / 1024:.1f}MB"
+        opts = ["BODY=8BITMIME"] if smtp.has_extn("8bitmime") else []
+        try:
+            smtp.sendmail(s.forward_from, s.forward_to, data, mail_options=opts)
+        except smtplib.SMTPRecipientsRefused:
+            raise  # 転送先アドレスの問題（設定の問題）
+        except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as e:
+            # サイズ超過は MAIL FROM（SIZE=...）の時点で断られることもある
+            detail = e.smtp_error.decode(errors="replace") if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
+            if e.smtp_code >= 500:
+                return "rejected", f"{e.smtp_code} {detail}"
+            raise MessageTransient(f"一時的に受け付けられませんでした（{e.smtp_code} {detail}）") from e
+        except (smtplib.SMTPException, OSError) as e:
+            raise MessageTransient(f"送信の途中で失敗しました（{e}）") from e
+        return "sent", ""
+    finally:
+        _safe_quit(smtp)
+
+
 # ---------------------------------------------------------------- 本体
+
+# 送信の途中で失敗した回数（メールごと）。接続できないだけのときは数えない
+_failures: dict = {}
+FAIL_STEP = 3      # この回数失敗するごとに、小さい形（添付なし → ヘッダーのみ）に切り替える
+FAIL_GIVE_UP = 9   # この回数失敗したら、そのメールは飛ばす
+
 
 def _remember(state: dict, key: str) -> None:
     ids = state.setdefault("forwarded_ids", [])
@@ -578,22 +647,44 @@ def forward_one(s: Settings, state: dict, folder: str, uid: int, raw: bytes) -> 
     if not matches_filter(s, msg):
         log.info("%s: 条件に合わないので転送しません: %s", where, subject)
         return
-    try:
-        send_mail(s, build_forward(s, msg))
-    except smtplib.SMTPDataError as e:
-        if e.smtp_code < 500:
-            raise  # 一時的なエラー → 次回やり直す
-        # 内容やサイズが原因で拒否された → 添付ファイルを外してもう一度だけ送る
-        log.warning("%s: 転送先に拒否されました（%s）。添付ファイルを外して送り直します", where, e)
+
+    fails = _failures.get(key, 0)
+    if fails >= FAIL_GIVE_UP:
+        log.error("%s: %d 回続けて送信に失敗したので、このメールは飛ばします: %s", where, fails, subject)
+        _failures.pop(key, None)
+        return
+    # 送信の途中で何度も失敗しているメールは、最初から小さい形で送る
+    level = min(fails // FAIL_STEP, LEVEL_HEADERS_ONLY)
+    reason = "送信に何度も失敗した" if level else ""
+
+    while level <= LEVEL_HEADERS_ONLY:
         try:
-            send_mail(s, build_forward(s, msg, include_attachments=False))
-        except smtplib.SMTPDataError as e2:
-            if e2.smtp_code < 500:
-                raise
-            log.error("%s: 転送できませんでした（%s）。このメールは飛ばします: %s", where, e2, subject)
+            data = build_forward(s, msg, level=level, reason=reason)
+        except Exception:
+            log.exception("%s: 転送メールを作れませんでした%s", where, LEVEL_LABEL[level])
+            level, reason = level + 1, "うまく変換できなかった"
+            continue
+        try:
+            result, detail = deliver(s, data)
+        except MessageTransient as e:
+            _failures[key] = fails + 1
+            log.warning("%s: %s（%d 回目）。次の確認でもう一度送ります", where, e, fails + 1)
+            raise
+        if result == "sent":
+            _failures.pop(key, None)
+            _remember(state, key)
+            log.info("%s: 転送しました%s: %s", where, LEVEL_LABEL[level], subject)
             return
-    _remember(state, key)
-    log.info("%s: 転送しました: %s", where, subject)
+        if level == LEVEL_HEADERS_ONLY:
+            # ヘッダーだけの小さなメールまで断られた → メールではなく設定の問題の可能性が高いので、飛ばさずに止める
+            raise smtplib.SMTPException(
+                f"ヘッダーだけの転送メールも送信を断られました（{detail}）。[forward] の from / to の設定を確認してください")
+        log.warning("%s: 送れませんでした（%s）。%sを外して送り直します",
+                    where, detail, "添付ファイル" if level == LEVEL_FULL else "本文")
+        level += 1
+        reason = "大きすぎて送れなかった" if result == "too_big" else "転送先のサーバーに受け付けられなかった"
+
+    log.error("%s: 転送メールを作れなかったので、このメールは飛ばします: %s", where, subject)
 
 
 def init_state(imap, s: Settings, state_path: Path, reason: str) -> dict:
@@ -642,7 +733,13 @@ def process_folder(imap, s: Settings, state: dict, state_path: Path, name: str) 
             if raw is None:
                 log.warning("[%s] UID %d を取得できませんでした（削除された可能性）。飛ばします", name, uid)
             else:
-                forward_one(s, state, name, uid, raw)  # 送信に失敗したら例外 → 位置を進めずに次回やり直す
+                try:
+                    forward_one(s, state, name, uid, raw)
+                except (AuthError, OSError, smtplib.SMTPException, imaplib.IMAP4.error, RuntimeError):
+                    raise  # 通信や送信の失敗 → 位置を進めずに次回やり直す
+                except Exception:
+                    # このメール固有の想定外のエラー。ここで止まると後続のメールも転送されなくなるので飛ばす
+                    log.exception("[%s] UID %d: 想定外のエラーが起きたので、このメールは飛ばします", name, uid)
         fs["last_uid"] = uid
         save_state(state_path, state)
     if skipped_old:
@@ -685,6 +782,9 @@ def run_forever(s: Settings, state_path: Path) -> None:
             raise
         except (imaplib.IMAP4.error, OSError, smtplib.SMTPException, RuntimeError) as e:
             log.warning("エラー: %s（%d 秒後に再接続します）", e, backoff)
+        except Exception:
+            # 想定外のエラーでもプロセスは終了させない（終了→再起動を繰り返して止まるのを防ぐ）
+            log.exception("想定外のエラー（%d 秒後に再接続します）", backoff)
         finally:
             if imap is not None:
                 _safe_logout(imap)
