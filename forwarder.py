@@ -22,14 +22,15 @@ import html
 import imaplib
 import json
 import logging
+import mimetypes
 import os
 import re
 import smtplib
 import ssl
 import sys
 import time
-import uuid
 from dataclasses import dataclass
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import default as DEFAULT_POLICY
@@ -372,10 +373,23 @@ def fetch_raw(imap, uid: int):
 # ---------------------------------------------------------------- メール組み立て
 
 def _header(msg, name: str) -> str:
-    try:
-        value = str(msg.get(name, "") or "")
-    except Exception:
+    """ヘッダーを表示用の文字列にする。アドレスを解釈し直さず、元の文字列をそのまま復号する
+    （解釈し直すと「名前 (aizu) <addr>」のコメント部分が消えるため）。"""
+    value = None
+    for key, raw in msg.raw_items():
+        if key.lower() == name.lower():
+            value = raw
+            break
+    if value is None:
         return ""
+    value = re.sub(r"\r?\n[ \t]+", " ", str(value))  # 折り返しを戻す
+    try:
+        value = str(make_header(decode_header(value)))
+    except Exception:
+        try:
+            value = str(msg.get(name, "") or "")
+        except Exception:
+            pass
     return re.sub(r"[\r\n]+\s*", " ", value).strip()
 
 
@@ -391,82 +405,115 @@ def matches_filter(s: Settings, msg) -> bool:
     return hit(_header(msg, "From"), s.from_contains) and hit(_header(msg, "Subject"), s.subject_contains)
 
 
+def html_to_text(src: str) -> str:
+    """HTML メールをテキストにする。リンクは [文字](URL) の形で残す。"""
+    t = re.sub(r"(?is)<(script|style|head|title)\b.*?</\1\s*>", "", src)
+    t = re.sub(r"(?s)<!--.*?-->", "", t)
+    t = re.sub(r"\s+", " ", t)  # HTML ソース上の改行は表示上の改行ではない
+
+    def link(m):
+        href = html.unescape(m.group(1)).strip()
+        label = " ".join(html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).split())
+        if not href or href.startswith("#"):
+            return label
+        if not label or label == href:
+            return href
+        return f"[{label}]({href})"
+
+    t = re.sub(r"(?is)<a\b[^>]*?\bhref\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</a\s*>", link, t)
+    t = re.sub(r"(?i)<br\s*/?>", "\n", t)
+    t = re.sub(r"(?i)<li\b[^>]*>", "\n- ", t)
+    t = re.sub(r"(?i)</?(p|div|h[1-6]|ul|ol|table|tr|blockquote|section|article|header|footer)\b[^>]*>", "\n\n", t)
+    t = re.sub(r"(?i)</t[dh]\s*>", " ", t)
+    t = html.unescape(re.sub(r"<[^>]+>", "", t)).replace("\xa0", " ")
+    t = "\n".join(line.strip() for line in t.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
 def extract_text(msg, limit: int = 20000) -> str:
+    """本文をテキストで取り出す。テキスト版があればそれを、無ければ HTML 版を変換して使う。"""
     try:
         part = msg.get_body(preferencelist=("plain", "html"))
         if part is None:
             return ""
         text = part.get_content()
         if part.get_content_subtype() == "html":
-            text = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", text)
-            text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", text)
-            text = html.unescape(re.sub(r"<[^>]+>", "", text))
-            text = re.sub(r"[ \t]+\n", "\n", text)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-        text = text.strip()
+            text = html_to_text(text)
+        else:
+            text = "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n")).strip("\n")
         if len(text) > limit:
-            text = text[:limit] + "\n…（以下省略。全文は添付の元メールを見てください）"
+            text = text[:limit] + "\n…（以下省略。全文は大学のメールで確認してください）"
         return text
     except Exception as e:  # 文字コード不明など
         log.debug("本文の取り出しに失敗: %s", e)
         return ""
 
 
-def build_forward(s: Settings, raw: bytes, msg, attach_original: bool = True, folder: str = "") -> bytes:
-    """本文をテキストで載せ、元メールをそのまま .eml として添付した転送メールを作る。"""
+def collect_attachments(msg) -> list:
+    """元メールの添付ファイルを [(ファイル名, maintype, subtype, データ)] で返す。HTML 内の埋め込み画像は除く。"""
+    result = []
+    for part in msg.iter_attachments():
+        try:
+            maintype = part.get_content_maintype()
+            if (maintype == "image" and part.get("Content-ID")
+                    and part.get_content_disposition() != "attachment"):
+                continue  # HTML メールに埋め込まれたロゴなど
+            if maintype == "multipart":
+                continue
+            filename = part.get_filename() or ""
+            if maintype == "message":  # メールにメールが添付されている場合
+                inner = part.get_payload(0) if part.is_multipart() else None
+                data = inner.as_bytes() if inner is not None else (part.get_payload(decode=True) or b"")
+                result.append((filename or "message.eml", "application", "octet-stream", data))
+                continue
+            data = part.get_payload(decode=True) or b""
+            if not filename:
+                filename = "attachment" + (mimetypes.guess_extension(part.get_content_type()) or "")
+            result.append((filename, maintype, part.get_content_subtype(), data))
+        except Exception as e:
+            log.warning("添付ファイルを取り出せませんでした: %s", e)
+    return result
+
+
+def build_forward(s: Settings, msg, include_attachments: bool = True) -> bytes:
+    """Thunderbird の「インラインで転送」と同じ形の転送メールを作る。元メールの添付ファイルも付ける。"""
     subject = _header(msg, "Subject")
-    attach = attach_original and len(raw) <= s.max_attach_bytes
 
-    lines = [
-        "---------- 転送メッセージ ----------",
-        f"From: {_header(msg, 'From')}",
-        f"Date: {_header(msg, 'Date')}",
-        f"Subject: {subject}",
-        f"To: {_header(msg, 'To')}",
-    ]
-    if folder and folder.upper() != "INBOX":
-        lines.append(f"フォルダ: {folder}")
-    lines += ["", extract_text(msg) or "（本文をテキストで表示できません。添付の元メールを開いてください）"]
-    if not attach:
-        why = (f"サイズが大きい（{len(raw) / 1024 / 1024:.1f}MB）" if attach_original
-               else "転送先のサーバーに受け付けられなかった")
-        lines += ["", f"※元のメールは{why}ため添付していません。大学のメールで確認してください。"]
-    body = "\n".join(lines)
+    lines = ["-------- Forwarded Message --------"]
+    for label, name in (("Subject", "Subject"), ("Date", "Date"), ("From", "From"),
+                        ("Reply-To", "Reply-To"), ("To", "To"), ("CC", "Cc")):
+        value = _header(msg, name)
+        if value or name in ("Subject", "Date", "From", "To"):
+            lines.append(f"{label}:\t{value}")
+    lines += ["", "", extract_text(msg) or "（本文をテキストで表示できません。大学のメールで確認してください）"]
 
-    head = EmailMessage(policy=SMTP_POLICY)
-    head["From"] = s.forward_from
-    head["To"] = ", ".join(s.forward_to)
-    head["Subject"] = "Fwd: " + (subject or "(件名なし)")
-    head["Date"] = formatdate(localtime=True)
-    head["Message-ID"] = make_msgid(domain=s.forward_from.rpartition("@")[2] or None)
+    attachments = collect_attachments(msg)
+    if attachments:
+        names = "、".join(a[0] for a in attachments)
+        total = sum(len(a[3]) for a in attachments)
+        why = None
+        if not include_attachments:
+            why = "転送先のサーバーに受け付けられなかった"
+        elif total > s.max_attach_bytes:
+            why = f"大きい（合計 {total / 1024 / 1024:.1f}MB）"
+        if why:
+            lines += ["", f"※添付ファイル（{names}）は{why}ため転送していません。大学のメールで確認してください。"]
+            attachments = []
+
+    fwd = EmailMessage(policy=SMTP_POLICY)
+    fwd["From"] = s.forward_from
+    fwd["To"] = ", ".join(s.forward_to)
+    fwd["Subject"] = "Fwd: " + (subject or "(件名なし)")
+    fwd["Date"] = formatdate(localtime=True)
+    fwd["Message-ID"] = make_msgid(domain=s.forward_from.rpartition("@")[2] or None)
     orig_id = _header(msg, "Message-ID")
     if orig_id:
-        head["References"] = orig_id
-    head[LOOP_HEADER] = "1"
-    # 本文は自前で組むので、ヘッダー部分だけを生成する
-    headers = head.as_bytes().rstrip(b"\r\n") + b"\r\n"
-
-    boundary = "=_fwd_" + uuid.uuid4().hex
-    out = [
-        headers,
-        b"MIME-Version: 1.0\r\n",
-        f'Content-Type: multipart/mixed; boundary="{boundary}"\r\n\r\n'.encode(),
-        f"--{boundary}\r\n".encode(),
-        b'Content-Type: text/plain; charset="utf-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n',
-        base64.encodebytes(body.encode("utf-8")).replace(b"\n", b"\r\n"),
-    ]
-    if attach:
-        original = re.sub(rb"\r?\n", b"\r\n", raw)  # 元メールは一切書き換えずに添付
-        cte = b"7bit" if original.isascii() else b"8bit"
-        out += [
-            f"--{boundary}\r\n".encode(),
-            b"Content-Type: message/rfc822\r\n"
-            b'Content-Disposition: attachment; filename="original.eml"\r\n'
-            b"Content-Transfer-Encoding: " + cte + b"\r\n\r\n",
-            original if original.endswith(b"\r\n") else original + b"\r\n",
-        ]
-    out.append(f"--{boundary}--\r\n".encode())
-    return b"".join(out)
+        fwd["References"] = orig_id
+    fwd[LOOP_HEADER] = "1"
+    fwd.set_content("\n".join(lines) + "\n", cte="base64")
+    for filename, maintype, subtype, data in attachments:
+        fwd.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
+    return fwd.as_bytes()
 
 
 # ---------------------------------------------------------------- SMTP
@@ -532,14 +579,14 @@ def forward_one(s: Settings, state: dict, folder: str, uid: int, raw: bytes) -> 
         log.info("%s: 条件に合わないので転送しません: %s", where, subject)
         return
     try:
-        send_mail(s, build_forward(s, raw, msg, folder=folder))
+        send_mail(s, build_forward(s, msg))
     except smtplib.SMTPDataError as e:
         if e.smtp_code < 500:
             raise  # 一時的なエラー → 次回やり直す
-        # 内容やサイズが原因で拒否された → 元メールを添付せずにもう一度だけ送る
-        log.warning("%s: 転送先に拒否されました（%s）。元メールを添付せずに送り直します", where, e)
+        # 内容やサイズが原因で拒否された → 添付ファイルを外してもう一度だけ送る
+        log.warning("%s: 転送先に拒否されました（%s）。添付ファイルを外して送り直します", where, e)
         try:
-            send_mail(s, build_forward(s, raw, msg, attach_original=False, folder=folder))
+            send_mail(s, build_forward(s, msg, include_attachments=False))
         except smtplib.SMTPDataError as e2:
             if e2.smtp_code < 500:
                 raise
